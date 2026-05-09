@@ -154,11 +154,37 @@ class ImportServiceImpl(ImportService):
         for item in valid_items:
             item.flight_name = flight_name
 
-        # Auto-cleanup: clear old data, insert new data
+        # FIFO: if flight already exists, delete its old data first
+        # (allows re-importing the same flight)
         try:
-            await self._db.delete_all_items()
+            await self._db.delete_by_flight(flight_name)
+            await self._db.delete_flight_history(flight_name)
+        except Exception:
+            pass  # Flight didn't exist, that's fine
+
+        # FIFO: if 20 flights exist, delete the oldest one
+        try:
+            flight_count = await self._db.get_flight_count()
+            if flight_count >= 20:
+                oldest = await self._db.get_oldest_flight()
+                if oldest and oldest != flight_name:
+                    deleted = await self._db.delete_by_flight(oldest)
+                    await self._db.delete_flight_history(oldest)
+                    logger.info(
+                        "FIFO: deleted oldest flight '%s' (%d items) to make room",
+                        oldest, deleted,
+                    )
+        except Exception as e:
+            logger.warning("FIFO cleanup warning: %s", e)
+
+        # Insert new data
+        try:
             imported = await self._db.insert_cargo_items(valid_items)
-            logger.info("Import complete: %d rows imported (flight: %s)", imported, flight_name)
+            await self._db.record_import(flight_name, imported)
+            logger.info(
+                "Import complete: %d rows imported (flight: %s)",
+                imported, flight_name,
+            )
         except Exception as e:
             logger.error("Import failed: %s", e)
             return ImportResult(

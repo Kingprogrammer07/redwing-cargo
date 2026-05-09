@@ -14,6 +14,10 @@ from bot.models import CargoItem, FlightConfig
 
 logger = logging.getLogger(__name__)
 
+# ─── Constants ─────────────────────────────────────────────────────────────
+
+_MAX_FLIGHTS: int = 20  # Max flights to keep in database
+
 # ─── SQL Constants: cargo_items ─────────────────────────────────────────────
 
 _CREATE_TABLE_SQL: str = """
@@ -95,6 +99,40 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at = excluded.updated_at
 """
 
+# ─── SQL Constants: import_history ─────────────────────────────────────────
+
+_CREATE_IMPORT_HISTORY_SQL: str = """
+CREATE TABLE IF NOT EXISTS import_history (
+    flight_name TEXT PRIMARY KEY,
+    imported_at TEXT NOT NULL,
+    item_count INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+_RECORD_IMPORT_SQL: str = """
+INSERT INTO import_history (flight_name, imported_at, item_count)
+VALUES (?, ?, ?)
+ON CONFLICT(flight_name) DO UPDATE SET
+    imported_at = excluded.imported_at,
+    item_count = excluded.item_count
+"""
+
+_GET_OLDEST_FLIGHT_SQL: str = """
+SELECT flight_name FROM import_history
+ORDER BY imported_at ASC
+LIMIT 1
+"""
+
+_GET_FLIGHT_COUNT_SQL: str = "SELECT COUNT(*) FROM import_history"
+
+_DELETE_IMPORT_HISTORY_SQL: str = "DELETE FROM import_history WHERE flight_name = ?"
+
+_GET_ALL_IMPORTS_SQL: str = """
+SELECT flight_name, imported_at, item_count 
+FROM import_history 
+ORDER BY imported_at DESC
+"""
+
 
 class DatabaseManager:
     """Async SQLite database manager.
@@ -131,6 +169,7 @@ class DatabaseManager:
             await conn.execute(_CREATE_INDEX_CLIENT_SQL)
             await conn.execute(_CREATE_INDEX_FLIGHT_SQL)
             await conn.execute(_CREATE_FLIGHT_CONFIG_SQL)
+            await conn.execute(_CREATE_IMPORT_HISTORY_SQL)
             await conn.commit()
 
         DatabaseManager._initialized = True
@@ -247,14 +286,98 @@ class DatabaseManager:
                 return {"total": total}
 
     async def get_all_flights(self) -> List[str]:
-        """Get list of all unique flight names."""
+        """Get list of all unique flight names ordered by newest first."""
         async with aiosqlite.connect(self._db_path) as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(
-                "SELECT DISTINCT flight_name FROM cargo_items WHERE flight_name != '' ORDER BY flight_name"
+                """SELECT DISTINCT c.flight_name 
+                   FROM cargo_items c 
+                   WHERE c.flight_name != '' 
+                   ORDER BY (
+                       SELECT imported_at 
+                       FROM import_history h 
+                       WHERE h.flight_name = c.flight_name
+                   ) DESC"""
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [row[0] for row in rows]
+
+    # ─── Import History (FIFO tracking) ─────────────────────────────────────
+
+    async def record_import(
+        self, flight_name: str, item_count: int = 0
+    ) -> None:
+        """Record a flight import in history for FIFO tracking.
+        
+        Args:
+            flight_name: Name of the flight that was imported.
+            item_count: Number of items imported.
+        """
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(self._db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(
+                _RECORD_IMPORT_SQL, (flight_name, now, item_count)
+            )
+            await conn.commit()
+        logger.info(
+            "Recorded import history: flight=%s, items=%d", flight_name, item_count
+        )
+
+    async def get_flight_count(self) -> int:
+        """Get total number of flights in import history.
+        
+        Returns:
+            Number of unique flights.
+        """
+        async with aiosqlite.connect(self._db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(_GET_FLIGHT_COUNT_SQL) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+
+    async def get_oldest_flight(self) -> Optional[str]:
+        """Get the oldest flight name for FIFO cleanup.
+        
+        Returns:
+            Oldest flight name or None if no history.
+        """
+        async with aiosqlite.connect(self._db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(_GET_OLDEST_FLIGHT_SQL) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else None
+
+    async def delete_flight_history(self, flight_name: str) -> None:
+        """Remove a flight from import history.
+        
+        Args:
+            flight_name: Flight to remove from history.
+        """
+        async with aiosqlite.connect(self._db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(_DELETE_IMPORT_HISTORY_SQL, (flight_name,))
+            await conn.commit()
+        logger.debug("Deleted flight history: %s", flight_name)
+
+    async def get_import_history(self) -> List[Dict[str, Any]]:
+        """Get full import history ordered by newest first.
+        
+        Returns:
+            List of dicts with flight_name, imported_at, item_count.
+        """
+        async with aiosqlite.connect(self._db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(_GET_ALL_IMPORTS_SQL) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    {
+                        "flight_name": row["flight_name"],
+                        "imported_at": row["imported_at"],
+                        "item_count": row["item_count"],
+                    }
+                    for row in rows
+                ]
 
     # ─── Flight Config ──────────────────────────────────────────────────────
 
