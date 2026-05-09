@@ -220,7 +220,6 @@ class MessageFormatter:
         return (
             "📁 <b>Excel faylni yuklang</b>\n\n"
             "Iltimos, .xlsx formatidagi Excel faylni yuboring.\n"
-            "Eski ma'lumotlar avtomatik o'chirilib, yangilari yoziladi."
         )
 
     @staticmethod
